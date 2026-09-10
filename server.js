@@ -6,13 +6,14 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Baileys import
 import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
-    Browsers
+    Browsers,
+    extractMessageContent,
+    normalizeMessageContent
 } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -141,6 +142,119 @@ function resolveLidToPhone(sessionDir, lid) {
         console.error('Error resolviendo LID:', err.message);
     }
     return null;
+}
+
+/**
+ * Extrae de forma exhaustiva el texto de cualquier mensaje de WhatsApp
+ * soportando mensajes extendidos, editados, efímeros, respuestas y botones.
+ */
+function getMessageBody(msg) {
+    if (!msg) return '';
+    let m = null;
+    try {
+        m = extractMessageContent(msg.message) || normalizeMessageContent(msg.message) || msg.message;
+    } catch (e) {
+        m = msg.message;
+    }
+    if (!m) return '';
+
+    // Desempaquetar capas recursivas si están anidadas
+    for (let i = 0; i < 5; i++) {
+        if (m?.deviceSentMessage?.message) {
+            m = extractMessageContent(m.deviceSentMessage.message) || m.deviceSentMessage.message;
+        } else if (m?.editedMessage?.message?.protocolMessage?.editedMessage) {
+            m = extractMessageContent(m.editedMessage.message.protocolMessage.editedMessage) || m.editedMessage.message.protocolMessage.editedMessage;
+        } else if (m?.ephemeralMessage?.message) {
+            m = extractMessageContent(m.ephemeralMessage.message) || m.ephemeralMessage.message;
+        } else if (m?.viewOnceMessage?.message) {
+            m = extractMessageContent(m.viewOnceMessage.message) || m.viewOnceMessage.message;
+        } else if (m?.viewOnceMessageV2?.message) {
+            m = extractMessageContent(m.viewOnceMessageV2.message) || m.viewOnceMessageV2.message;
+        } else if (m?.documentWithCaptionMessage?.message) {
+            m = extractMessageContent(m.documentWithCaptionMessage.message) || m.documentWithCaptionMessage.message;
+        } else {
+            break;
+        }
+    }
+
+    if (typeof m?.conversation === 'string' && m.conversation.trim()) {
+        return m.conversation.trim();
+    }
+    if (typeof m?.extendedTextMessage?.text === 'string' && m.extendedTextMessage.text.trim()) {
+        return m.extendedTextMessage.text.trim();
+    }
+    if (typeof m?.imageMessage?.caption === 'string' && m.imageMessage.caption.trim()) {
+        return m.imageMessage.caption.trim();
+    }
+    if (typeof m?.videoMessage?.caption === 'string' && m.videoMessage.caption.trim()) {
+        return m.videoMessage.caption.trim();
+    }
+    if (typeof m?.documentMessage?.caption === 'string' && m.documentMessage.caption.trim()) {
+        return m.documentMessage.caption.trim();
+    }
+    if (typeof m?.buttonsResponseMessage?.selectedDisplayText === 'string') {
+        return m.buttonsResponseMessage.selectedDisplayText.trim();
+    }
+    if (typeof m?.listResponseMessage?.title === 'string') {
+        return m.listResponseMessage.title.trim();
+    }
+    if (typeof m?.templateButtonReplyMessage?.selectedDisplayText === 'string') {
+        return m.templateButtonReplyMessage.selectedDisplayText.trim();
+    }
+
+    // Búsqueda exhaustiva recursiva de cualquier propiedad con texto
+    function deepText(obj, depth = 0) {
+        if (!obj || typeof obj !== 'object' || depth > 4) return '';
+        if (typeof obj.conversation === 'string' && obj.conversation) return obj.conversation;
+        if (typeof obj.text === 'string' && obj.text && typeof obj.text !== 'object') return obj.text;
+        if (typeof obj.caption === 'string' && obj.caption) return obj.caption;
+        if (typeof obj.selectedDisplayText === 'string' && obj.selectedDisplayText) return obj.selectedDisplayText;
+
+        for (const k of Object.keys(obj)) {
+            if (k === 'contextInfo' || k === 'key' || k === 'senderKeyDistributionMessage') continue;
+            if (typeof obj[k] === 'object' && obj[k] !== null) {
+                const res = deepText(obj[k], depth + 1);
+                if (res) return res;
+            }
+        }
+        return '';
+    }
+
+    return deepText(m).trim();
+}
+
+/**
+ * Detecta si el mensaje contiene contenido multimedia
+ */
+function hasMedia(msg) {
+    let m = null;
+    try {
+        m = extractMessageContent(msg.message) || normalizeMessageContent(msg.message) || msg.message;
+    } catch (e) {
+        m = msg.message;
+    }
+    if (!m) return false;
+    return !!(m.imageMessage || m.videoMessage || m.audioMessage || m.documentMessage || m.stickerMessage);
+}
+
+/**
+ * Identifica si es un mensaje de señalización o protocolo interno de WhatsApp
+ * que NO representa un mensaje de usuario a mostrar en chat.
+ */
+function isSignalingOrProtocolMessage(msg) {
+    const m = msg?.message;
+    if (!m) return true;
+    const keys = Object.keys(m);
+    if (keys.length === 0) return true;
+    const nonProtocolKeys = keys.filter(k => 
+        k !== 'senderKeyDistributionMessage' && 
+        k !== 'messageContextInfo' && 
+        k !== 'protocolMessage' &&
+        k !== 'appStateSyncKeyShare' &&
+        k !== 'appStateSyncKeyFingerprint' &&
+        k !== 'reactionMessage'
+    );
+    return nonProtocolKeys.length === 0;
 }
 
 async function initSession(instanceName, forceRefresh = false) {
@@ -281,6 +395,33 @@ async function initSession(instanceName, forceRefresh = false) {
         }
     });
 
+    // Sincronización continua de contactos y chats para asociar LIDs a teléfonos reales
+    sock.ev.on('contacts.upsert', (contacts) => {
+        try {
+            for (const c of contacts) {
+                if (c.id && c.lid) recordPhoneMapping(c.lid, c.id);
+                if (c.id && c.phoneNumber) recordPhoneMapping(c.id, c.phoneNumber);
+            }
+        } catch (e) {}
+    });
+
+    sock.ev.on('contacts.update', (updates) => {
+        try {
+            for (const c of updates) {
+                if (c.id && c.lid) recordPhoneMapping(c.lid, c.id);
+                if (c.id && c.phoneNumber) recordPhoneMapping(c.id, c.phoneNumber);
+            }
+        } catch (e) {}
+    });
+
+    sock.ev.on('chats.upsert', (chats) => {
+        try {
+            for (const chat of chats) {
+                if (chat.id && chat.lid) recordPhoneMapping(chat.lid, chat.id);
+            }
+        } catch (e) {}
+    });
+
     // Escuchador de Mensajes Entrantes (Inbound Webhook)
     sock.ev.on('messages.upsert', async (mUpsert) => {
         try {
@@ -306,29 +447,43 @@ async function initSession(instanceName, forceRefresh = false) {
                     continue;
                 }
 
-                let senderPhone = remoteJid.split('@')[0];
+                // Filtrar eventos internos de WhatsApp que NO son mensajes de usuario (protocolos, sincronización de claves, etc.)
+                if (isSignalingOrProtocolMessage(msg)) {
+                    continue;
+                }
 
-                // 1. Revisar si tenemos mapeo registrado previo en memoria o disco
+                let senderPhone = remoteJid.split('@')[0].replace(/[^0-9]/g, '');
+                const rawLid = remoteJid.endsWith('@lid') ? senderPhone : null;
+
+                // 1. Revisar si WhatsApp incluyó el número telefónico real (senderPn / participantPn)
+                const senderPn = msg.key?.senderPn || msg.key?.participantPn || msg.participant;
+                if (senderPn) {
+                    const cleanPn = String(senderPn).split('@')[0].replace(/[^0-9]/g, '');
+                    if (cleanPn && cleanPn !== senderPhone) {
+                        recordPhoneMapping(remoteJid, cleanPn);
+                        if (rawLid) recordPhoneMapping(rawLid, cleanPn);
+                        senderPhone = cleanPn;
+                    }
+                }
+
+                // 2. Revisar si tenemos mapeo registrado previo en memoria o disco
                 if (phoneMap[senderPhone]) {
-                    console.log(`[${instanceName}] 🔄 JID ${senderPhone} resuelto por mapeo registrado a: ${phoneMap[senderPhone]}`);
+                    console.log(`[${instanceName}] 🔄 JID/LID ${senderPhone} resuelto por mapeo a: ${phoneMap[senderPhone]}`);
                     senderPhone = phoneMap[senderPhone];
                 }
-                // 2. Si viene como LID (@lid), resolver al número telefónico real del usuario
-                else if (remoteJid.endsWith('@lid')) {
-                    const resolved = resolveLidToPhone(sessionPath, senderPhone);
+                // 3. Si sigue siendo un LID (@lid), intentar resolver con Signal keys o último contacto de la instancia
+                else if (rawLid) {
+                    const resolved = resolveLidToPhone(sessionPath, rawLid);
                     if (resolved) {
-                        console.log(`[${instanceName}] 🔄 LID ${senderPhone} resuelto exitosamente a teléfono: ${resolved}`);
-                        recordPhoneMapping(senderPhone, resolved);
+                        console.log(`[${instanceName}] 🔄 LID ${rawLid} resuelto en sesión a teléfono: ${resolved}`);
+                        recordPhoneMapping(rawLid, resolved);
                         senderPhone = resolved;
-                    } else if (msg.key?.participant) {
-                        const partPhone = msg.key.participant.split('@')[0].replace(/[^0-9]/g, '');
-                        if (partPhone) {
-                            console.log(`[${instanceName}] 🔄 Participante resuelto a teléfono: ${partPhone}`);
-                            recordPhoneMapping(senderPhone, partPhone);
-                            senderPhone = partPhone;
-                        }
+                    } else if (instData.lastContactPhone) {
+                        console.log(`[${instanceName}] 🔄 LID ${rawLid} asociado al último contacto activo: ${instData.lastContactPhone}`);
+                        recordPhoneMapping(rawLid, instData.lastContactPhone);
+                        senderPhone = instData.lastContactPhone;
                     } else {
-                        console.log(`[${instanceName}] ℹ️ LID ${senderPhone} detectado sin sesión vinculada aún.`);
+                        console.log(`[${instanceName}] ℹ️ LID ${rawLid} detectado (se enviará con lid para resolución en backend).`);
                     }
                 }
 
@@ -337,33 +492,18 @@ async function initSession(instanceName, forceRefresh = false) {
                     await sock.readMessages([msg.key]);
                 } catch (e) {}
 
-                let bodyText = '';
-                let m = msg.message;
+                // Extraer el texto real del mensaje de manera exhaustiva
+                const bodyText = getMessageBody(msg);
+                const isMedia = hasMedia(msg);
 
-                // Desenvolver envoltorios efímeros (mensajes temporales), vista única o adjuntos con texto
-                while (m && (m.ephemeralMessage || m.viewOnceMessage || m.viewOnceMessageV2 || m.documentWithCaptionMessage)) {
-                    m = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.documentWithCaptionMessage?.message;
+                // Si no hay texto ni multimedia (mensaje vacío o protocolo residual), no enviar al webhook
+                if (!bodyText && !isMedia) {
+                    continue;
                 }
 
-                if (m?.conversation) {
-                    bodyText = m.conversation;
-                } else if (m?.extendedTextMessage?.text) {
-                    bodyText = m.extendedTextMessage.text;
-                } else if (m?.imageMessage?.caption) {
-                    bodyText = m.imageMessage.caption;
-                } else if (m?.documentMessage?.caption) {
-                    bodyText = m.documentMessage.caption;
-                } else if (m?.videoMessage?.caption) {
-                    bodyText = m.videoMessage.caption;
-                } else if (m?.buttonsResponseMessage?.selectedDisplayText) {
-                    bodyText = m.buttonsResponseMessage.selectedDisplayText;
-                } else if (m?.listResponseMessage?.title) {
-                    bodyText = m.listResponseMessage.title;
-                } else if (m?.templateButtonReplyMessage?.selectedDisplayText) {
-                    bodyText = m.templateButtonReplyMessage.selectedDisplayText;
-                }
+                const finalMessage = bodyText || (isMedia ? '[Archivo adjunto / Multimedia]' : '');
 
-                console.log(`[${instanceName}] 📩 Mensaje entrante de ${senderPhone}: "${(bodyText || '').substring(0, 60)}"`);
+                console.log(`[${instanceName}] 📩 Mensaje entrante de ${senderPhone}: "${finalMessage.substring(0, 60)}"`);
 
                 // Enviar payload al Webhook de Help House
                 if (WEBHOOK_URL) {
@@ -373,8 +513,9 @@ async function initSession(instanceName, forceRefresh = false) {
                             instanceName: instanceName,
                             messageId: msg.key?.id,
                             from: senderPhone,
+                            lid: rawLid || null,
                             pushName: msg.pushName || null,
-                            message: bodyText || '[Mensaje o elemento multimedia]',
+                            message: finalMessage,
                             timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000)
                         };
 
@@ -546,6 +687,7 @@ app.post('/message/sendText/:instanceName', async (req, res) => {
         const sent = await inst.sock.sendMessage(jid, { text });
 
         // Mapear JID y remoteJid al número telefónico real del destinatario
+        inst.lastContactPhone = cleanNumber;
         recordPhoneMapping(jid, cleanNumber);
         if (sent?.key?.remoteJid) {
             recordPhoneMapping(sent.key.remoteJid, cleanNumber);
@@ -604,6 +746,7 @@ app.post('/message/sendMedia/:instanceName', async (req, res) => {
         const sent = await inst.sock.sendMessage(jid, msgOptions);
 
         // Mapear JID y remoteJid al número telefónico real del destinatario
+        inst.lastContactPhone = cleanNumber;
         recordPhoneMapping(jid, cleanNumber);
         if (sent?.key?.remoteJid) {
             recordPhoneMapping(sent.key.remoteJid, cleanNumber);
