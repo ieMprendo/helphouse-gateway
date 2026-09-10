@@ -21,7 +21,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 8080;
 const API_KEY = process.env.API_KEY || 'helphouse_secret_key';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://localhost/legal/public/api/whatsapp/webhook';
+let WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://coolabora.me/api/whatsapp/webhook';
 
 app.use(cors());
 app.use(express.json());
@@ -34,9 +34,52 @@ if (!fs.existsSync(SESSIONS_DIR)) {
     fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Health check root
+// Mapeo persistente de JIDs/LIDs a teléfonos reales
+const PHONE_MAP_FILE = path.join(SESSIONS_DIR, 'phone_mapping.json');
+let phoneMap = {};
+try {
+    if (fs.existsSync(PHONE_MAP_FILE)) {
+        phoneMap = JSON.parse(fs.readFileSync(PHONE_MAP_FILE, 'utf8'));
+    }
+} catch (e) {}
+
+function recordPhoneMapping(rawKey, realPhone) {
+    if (!rawKey || !realPhone) return;
+    const cleanKey = String(rawKey).split('@')[0].replace(/[^0-9]/g, '');
+    const cleanPhone = String(realPhone).replace(/[^0-9]/g, '');
+    if (cleanKey && cleanPhone && cleanKey !== cleanPhone) {
+        phoneMap[cleanKey] = cleanPhone;
+        try {
+            fs.writeFileSync(PHONE_MAP_FILE, JSON.stringify(phoneMap, null, 2), 'utf8');
+        } catch (e) {}
+    }
+}
+
+// Health check root con información de diagnóstico
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', service: 'Help House WhatsApp Gateway', uptime: process.uptime() });
+    res.json({
+        status: 'ok',
+        service: 'Help House WhatsApp Gateway',
+        uptime: process.uptime(),
+        webhookUrl: WEBHOOK_URL,
+        instancesCount: instances.size,
+        mappedPhones: Object.keys(phoneMap).length
+    });
+});
+
+// Endpoint para consultar o actualizar la URL del Webhook
+app.get('/webhook', (req, res) => {
+    res.json({ webhookUrl: WEBHOOK_URL });
+});
+
+app.post('/webhook/set', (req, res) => {
+    const { url } = req.body;
+    if (url && typeof url === 'string') {
+        WEBHOOK_URL = url.trim();
+        console.log(`[Gateway] 🔗 Webhook URL dinámicamente actualizada a: ${WEBHOOK_URL}`);
+        return res.json({ success: true, webhookUrl: WEBHOOK_URL });
+    }
+    res.status(400).json({ error: 'url es obligatoria' });
 });
 
 // Middleware simple de apikey
@@ -265,12 +308,25 @@ async function initSession(instanceName, forceRefresh = false) {
 
                 let senderPhone = remoteJid.split('@')[0];
 
-                // Si viene como LID (@lid), resolver al número telefónico real del usuario
-                if (remoteJid.endsWith('@lid')) {
+                // 1. Revisar si tenemos mapeo registrado previo en memoria o disco
+                if (phoneMap[senderPhone]) {
+                    console.log(`[${instanceName}] 🔄 JID ${senderPhone} resuelto por mapeo registrado a: ${phoneMap[senderPhone]}`);
+                    senderPhone = phoneMap[senderPhone];
+                }
+                // 2. Si viene como LID (@lid), resolver al número telefónico real del usuario
+                else if (remoteJid.endsWith('@lid')) {
                     const resolved = resolveLidToPhone(sessionPath, senderPhone);
                     if (resolved) {
                         console.log(`[${instanceName}] 🔄 LID ${senderPhone} resuelto exitosamente a teléfono: ${resolved}`);
+                        recordPhoneMapping(senderPhone, resolved);
                         senderPhone = resolved;
+                    } else if (msg.key?.participant) {
+                        const partPhone = msg.key.participant.split('@')[0].replace(/[^0-9]/g, '');
+                        if (partPhone) {
+                            console.log(`[${instanceName}] 🔄 Participante resuelto a teléfono: ${partPhone}`);
+                            recordPhoneMapping(senderPhone, partPhone);
+                            senderPhone = partPhone;
+                        }
                     } else {
                         console.log(`[${instanceName}] ℹ️ LID ${senderPhone} detectado sin sesión vinculada aún.`);
                     }
@@ -282,27 +338,32 @@ async function initSession(instanceName, forceRefresh = false) {
                 } catch (e) {}
 
                 let bodyText = '';
+                let m = msg.message;
 
-                if (msg.message?.conversation) {
-                    bodyText = msg.message.conversation;
-                } else if (msg.message?.extendedTextMessage?.text) {
-                    bodyText = msg.message.extendedTextMessage.text;
-                } else if (msg.message?.imageMessage?.caption) {
-                    bodyText = msg.message.imageMessage.caption;
-                } else if (msg.message?.documentMessage?.caption) {
-                    bodyText = msg.message.documentMessage.caption;
-                } else if (msg.message?.videoMessage?.caption) {
-                    bodyText = msg.message.videoMessage.caption;
+                // Desenvolver envoltorios efímeros (mensajes temporales), vista única o adjuntos con texto
+                while (m && (m.ephemeralMessage || m.viewOnceMessage || m.viewOnceMessageV2 || m.documentWithCaptionMessage)) {
+                    m = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.documentWithCaptionMessage?.message;
                 }
 
-                // Si aún está vacío pero hay mensaje de texto en otras variantes
-                if (!bodyText && msg.message) {
-                    bodyText = msg.message?.buttonsResponseMessage?.selectedDisplayText ||
-                               msg.message?.listResponseMessage?.title ||
-                               msg.message?.templateButtonReplyMessage?.selectedDisplayText || '';
+                if (m?.conversation) {
+                    bodyText = m.conversation;
+                } else if (m?.extendedTextMessage?.text) {
+                    bodyText = m.extendedTextMessage.text;
+                } else if (m?.imageMessage?.caption) {
+                    bodyText = m.imageMessage.caption;
+                } else if (m?.documentMessage?.caption) {
+                    bodyText = m.documentMessage.caption;
+                } else if (m?.videoMessage?.caption) {
+                    bodyText = m.videoMessage.caption;
+                } else if (m?.buttonsResponseMessage?.selectedDisplayText) {
+                    bodyText = m.buttonsResponseMessage.selectedDisplayText;
+                } else if (m?.listResponseMessage?.title) {
+                    bodyText = m.listResponseMessage.title;
+                } else if (m?.templateButtonReplyMessage?.selectedDisplayText) {
+                    bodyText = m.templateButtonReplyMessage.selectedDisplayText;
                 }
 
-                console.log(`[${instanceName}] 📩 Mensaje entrante de ${senderPhone}: "${bodyText.substring(0, 60)}"`);
+                console.log(`[${instanceName}] 📩 Mensaje entrante de ${senderPhone}: "${(bodyText || '').substring(0, 60)}"`);
 
                 // Enviar payload al Webhook de Help House
                 if (WEBHOOK_URL) {
@@ -313,11 +374,17 @@ async function initSession(instanceName, forceRefresh = false) {
                             messageId: msg.key?.id,
                             from: senderPhone,
                             pushName: msg.pushName || null,
-                            message: bodyText || '[Archivo o elemento multimedia]',
+                            message: bodyText || '[Mensaje o elemento multimedia]',
                             timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000)
                         };
 
-                        const response = await fetch(WEBHOOK_URL, {
+                        const targetUrl = WEBHOOK_URL.includes('?')
+                            ? `${WEBHOOK_URL}&api_key=${encodeURIComponent(API_KEY)}`
+                            : `${WEBHOOK_URL}?api_key=${encodeURIComponent(API_KEY)}`;
+
+                        console.log(`[${instanceName}] 🚀 Despachando webhook entrante a ${targetUrl}`);
+
+                        const response = await fetch(targetUrl, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
@@ -334,7 +401,7 @@ async function initSession(instanceName, forceRefresh = false) {
                             console.warn(`[${instanceName}] ⚠️ Webhook respondió con código ${response.status}:`, resData);
                         }
                     } catch (webhookErr) {
-                        console.error(`[${instanceName}] Error notificando al Webhook de Help House:`, webhookErr.message);
+                        console.error(`[${instanceName}] Error notificando al Webhook de Help House (${WEBHOOK_URL}):`, webhookErr.message);
                     }
                 }
             }
@@ -348,14 +415,19 @@ async function initSession(instanceName, forceRefresh = false) {
 
 // 1. Crear instancia
 app.post('/instance/create', async (req, res) => {
-    const { instanceName } = req.body;
+    const { instanceName, webhookUrl } = req.body;
     if (!instanceName) {
         return res.status(400).json({ error: 'instanceName es obligatorio' });
     }
 
+    if (webhookUrl && typeof webhookUrl === 'string') {
+        WEBHOOK_URL = webhookUrl.trim();
+        console.log(`[Gateway] 🔗 Webhook URL configurada en create: ${WEBHOOK_URL}`);
+    }
+
     try {
         await initSession(instanceName);
-        res.json({ success: true, instanceName, status: 'created' });
+        res.json({ success: true, instanceName, status: 'created', webhookUrl: WEBHOOK_URL });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -364,6 +436,11 @@ app.post('/instance/create', async (req, res) => {
 // 2. Conectar y obtener código QR
 app.get('/instance/connect/:instanceName', async (req, res) => {
     const { instanceName } = req.params;
+    if (req.query.webhookUrl) {
+        WEBHOOK_URL = String(req.query.webhookUrl).trim();
+        console.log(`[Gateway] 🔗 Webhook URL configurada en connect: ${WEBHOOK_URL}`);
+    }
+
     try {
         let inst = instances.get(instanceName);
         if (!inst) {
@@ -468,6 +545,12 @@ app.post('/message/sendText/:instanceName', async (req, res) => {
 
         const sent = await inst.sock.sendMessage(jid, { text });
 
+        // Mapear JID y remoteJid al número telefónico real del destinatario
+        recordPhoneMapping(jid, cleanNumber);
+        if (sent?.key?.remoteJid) {
+            recordPhoneMapping(sent.key.remoteJid, cleanNumber);
+        }
+
         // Guardar mensaje en store para resolver solicitudes de reintento de descifrado E2EE
         if (sent?.key?.id && sent?.message && inst.messageStore) {
             inst.messageStore.set(sent.key.id, sent.message);
@@ -519,6 +602,12 @@ app.post('/message/sendMedia/:instanceName', async (req, res) => {
         }
 
         const sent = await inst.sock.sendMessage(jid, msgOptions);
+
+        // Mapear JID y remoteJid al número telefónico real del destinatario
+        recordPhoneMapping(jid, cleanNumber);
+        if (sent?.key?.remoteJid) {
+            recordPhoneMapping(sent.key.remoteJid, cleanNumber);
+        }
 
         if (sent?.key?.id && sent?.message && inst.messageStore) {
             inst.messageStore.set(sent.key.id, sent.message);
